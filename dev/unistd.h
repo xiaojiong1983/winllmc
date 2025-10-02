@@ -13,7 +13,12 @@
 #include <string.h>
 #include <direct.h> // for _mkdir and _stat
 #include <io.h> // needed for _access below and _findfirst, _findnext, _findclose
+
+#ifdef _MSC_VER
+#pragma warning(disable : 4996) // disable deprecated warning for fopen, strdup, etc
 #pragma comment(lib, "Ws2_32.lib")  // Link Ws2_32.lib for socket functions
+#endif  
+
 #include <winsock2.h>
 
 #ifdef CLOCK_MONOTONIC

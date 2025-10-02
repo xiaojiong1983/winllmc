@@ -188,7 +188,7 @@ void dataloader_init(DataLoader *loader,
     }
     // debugging prints
     // printf("DataLoader: filename_pattern: %s\n", filename_pattern);
-    // printf("DataLoader: Found %ld tokens across %zu shards\n", ntok_total, loader->glob_result.gl_pathc);
+    // printf("DataLoader: Found %ld tokens across %Iu shards\n", ntok_total, loader->glob_result.gl_pathc);
 
     // allocate all the space we'll need
     loader->buffer = (uint16_t*)mallocCheck((B * T + 1) * sizeof(uint16_t));
@@ -304,7 +304,7 @@ void evalloader_reset(EvalLoader *loader) {
     int can_fit_examples = (int) (loader->B / ASSUMED_NUM_COMPLETIONS);
     if (can_fit_examples == 0) {
         // this could be fixed in the future, but for now keeping it simple and throw error when B too low
-        printf("HellaSwag EvalLoader: batch size %zu is < %d\n", loader->B, ASSUMED_NUM_COMPLETIONS);
+        printf("HellaSwag EvalLoader: batch size %Iu is < %d\n", loader->B, ASSUMED_NUM_COMPLETIONS);
         printf("---> HINT: Disable HellaSwag eval with -h 0, or increase batch size with -b\n");
         exit(EXIT_FAILURE);
     }

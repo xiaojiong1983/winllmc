@@ -1,47 +1,36 @@
 # 说明
-基于karpathy的llm.c在windows环境下进行移植，用作LLM的学习和实战
+本项目是对 karpathy 的 [llm.c](https://github.com/karpathy/llm.c) 在 Windows 环境下的移植版本，用于学习和实战大型语言模型（LLM）。
 
 # llm.c
+这是一个用纯C编写的 LLM 项目，无需依赖 245MB 的 PyTorch 或 107MB 的 Python。当前重点是预训练，尤其是复现 GPT-2 和 GPT-3 的迷你版本，同时提供一个并行的 PyTorch 参考实现 train_gpt2.py。目前，llm.c 的速度比 PyTorch Nightly 快约 7%。这里提供了一个简洁的 CPU fp32(32位单精度浮点数) 参考实现 train_gpt2.c，仅约 1000 行代码。
 
-LLMs in simple, pure C/CUDA with no need for 245MB of PyTorch or 107MB of cPython. Current focus is on pretraining, in particular reproducing the [GPT-2](https://github.com/openai/gpt-2) and [GPT-3](https://arxiv.org/abs/2005.14165) miniseries, along with a parallel PyTorch reference implementation in [train_gpt2.py](train_gpt2.py). You'll recognize this file as a slightly tweaked [nanoGPT](https://github.com/karpathy/nanoGPT), an earlier project of mine. Currently, llm.c is a bit faster than PyTorch Nightly (by about 7%). In addition to the bleeding edge mainline code in [train_gpt2.cu](train_gpt2.cu), we have a simple reference CPU fp32 implementation in ~1,000 lines of clean code in one file [train_gpt2.c](train_gpt2.c). I'd like this repo to only maintain C and CUDA code. Ports to other languages or repos are very welcome, but should be done in separate repos, and I am happy to link to them below in the "notable forks" section. Developer coordination happens in the [Discussions](https://github.com/karpathy/llm.c/discussions) and on Discord, either the `#llmc` channel on the [Zero to Hero](https://discord.gg/3zy8kqD9Cp) channel, or on `#llmdotc` on [GPU MODE](https://discord.gg/gpumode) Discord.
+## 快速开始
+目前最好的入门方式是复现 GPT-2（124M）模型，详细步骤见 [Discussion #481](https://github.com/karpathy/llm.c/discussions/481) 
+我们也可以使用 llm.c 或 PyTorch 复现 GPT-2 和 GPT-3 系列的其他模型，详见 scripts README。
 
-## quick start
-
-The best introduction to the llm.c repo today is reproducing the GPT-2 (124M) model. [Discussion #481](https://github.com/karpathy/llm.c/discussions/481) steps through this in detail. We can reproduce other models from the GPT-2 and GPT-3 series in both llm.c and in the parallel implementation of PyTorch. Have a look at the [scripts README](scripts/README.md).
-
-debugging tip: when you run the `make` command to build the binary, modify it by replacing `-O3` with `-g` so you can step through the code in your favorite IDE (e.g. vscode).
-
-## quick start (1 GPU, fp32 only)
-
-If you won't be training on multiple nodes, aren't interested in mixed precision, and are interested in learning CUDA, the fp32 (legacy) files might be of interest to you. These are files that were "checkpointed" early in the history of llm.c and frozen in time. They are simpler, more portable, and possibly easier to understand. Run the 1 GPU, fp32 code like this:
+我们在CPU进行体验，体验 llm.c 的训练过程，只是速度不会太快。例如，你可以微调 GPT-2 small（124M）来生成莎士比亚风格的文本：
 
 ```bash
-chmod u+x ./dev/download_starter_pack.sh
-./dev/download_starter_pack.sh
-make train_gpt2fp32cu
-./train_gpt2fp32cu
+build_tran_gpt2_cpu
+OMP_NUM_THREADS=8 
+./train_gpt2
 ```
 
-The download_starter_pack.sh script is a quick & easy way to get started and it downloads a bunch of .bin files that help get you off the ground. These contain: 1) the GPT-2 124M model saved in fp32, in bfloat16, 2) a "debug state" used in unit testing (a small batch of data, and target activations and gradients), 3) the GPT-2 tokenizer, and 3) the tokenized [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset. Alternatively, instead of running the .sh script, you can re-create these artifacts manually as follows:
+可以通过下述脚本来获得bin文件
 
 ```bash
-pip install -r requirements.txt
 python dev/data/tinyshakespeare.py
 python train_gpt2.py
 ```
 
-## quick start (CPU)
+上述命令会：
+下载已分词的 tinyshakespeare 数据集和 GPT-2 124M 权重
+在 C 中加载权重，用 AdamW 优化器训练 40 步（batch size=4，上下文长度=64）
+评估验证集损失并生成一些文本。
 
-The "I am so GPU poor that I don't even have one GPU" section. You can still enjoy seeing llm.c train! But you won't go too far. Just like the fp32 version above, the CPU version is an even earlier checkpoint in the history of llm.c, back when it was just a simple reference implementation in C. For example, instead of training from scratch, you can finetune a GPT-2 small (124M) to output Shakespeare-like text, as an example:
 
-```bash
-chmod u+x ./dev/download_starter_pack.sh
-./dev/download_starter_pack.sh
-make train_gpt2
-OMP_NUM_THREADS=8 ./train_gpt2
-```
+他在上面的第（1）行下载了一个已经标记的[tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt)数据集并下载GPT-2（124M）权重，（3）用C从中初始化，用AdamW在tineshakespeare上训练40步（使用批量4，上下文长度仅为64），评估验证损失，并对一些文本进行采样。老实说，除非你有一个强大的CPU（并且可以在启动命令中增加OMP线程的数量），否则你在CPU训练LLM方面不会走那么远，但这可能是一个很好的演示/参考。在我的MacBook Pro（苹果Silicon M3 Max）上，输出如下：
 
-If you'd prefer to avoid running the starter pack script, then as mentioned in the previous section you can reproduce the exact same .bin files and artifacts by running `python dev/data/tinyshakespeare.py` and then `python train_gpt2.py`.
 
 The above lines (1) download an already tokenized [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset and download the GPT-2 (124M) weights, (3) init from them in C and train for 40 steps on tineshakespeare with AdamW (using batch size 4, context length only 64), evaluate validation loss, and sample some text. Honestly, unless you have a beefy CPU (and can crank up the number of OMP threads in the launch command), you're not going to get that far on CPU training LLMs, but it might be a good demo/reference. The output looks like this on my MacBook Pro (Apple Silicon M3 Max):
 
@@ -79,7 +68,10 @@ Allay
 ---
 ```
 
-## datasets
+## 数据集
+
+/dev/data/(dataset).py 文件负责下载、分词并将 token 保存为 .bin 文件，方便 C 代码读取。
+例如：
 
 The data files inside `/dev/data/(dataset).py` are responsible for downloading, tokenizing and saving the tokens to .bin files, readable easily from C. So for example when you run:
 
@@ -87,16 +79,24 @@ The data files inside `/dev/data/(dataset).py` are responsible for downloading, 
 python dev/data/tinyshakespeare.py
 ```
 
+我们下载并标记[tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt)数据集。其输出如下：
+
+
 We download and tokenize the [tinyshakespeare](https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt) dataset. The output of this looks like this:
 
 ```
 writing 32,768 tokens to ./dev/data/tinyshakespeare/tiny_shakespeare_val.bin
 writing 305,260 tokens to ./dev/data/tinyshakespeare/tiny_shakespeare_train.bin
 ```
+.bin 文件结构：前 1024 字节是头部，后面是 uint16 类型的 token 流，使用 GPT-2 的分词器。
+更多数据集见 /dev/data 目录。
 
 The .bin files contain a short header (1024 bytes) and then a stream of tokens in uint16, indicating the token ids with the GPT-2 tokenizer. More datasets are available in `/dev/data`.
 
 ## test
+
+我附带了一个简单的单元测试，确保 C 代码与 PyTorch 代码结果一致。
+
 
 I am also attaching a simple unit test for making sure our C code agrees with the PyTorch code. On the CPU as an example, compile and run with:
 
@@ -104,6 +104,8 @@ I am also attaching a simple unit test for making sure our C code agrees with th
 make test_gpt2
 ./test_gpt2
 ```
+
+现在，它加载由train_gpt2.py编写的`gpt2_124M_debug_state.bin`文件，运行前向传递，将logits和loss与PyTorch参考实现进行比较，然后与Adam进行10次迭代训练，并确保loss与PyTorch匹配。为了测试GPU版本，我们运行：
 
 This now loads the `gpt2_124M_debug_state.bin` file that gets written by train_gpt2.py, runs a forward pass, compares the logits and loss with the PyTorch reference implementation, then it does 10 iterations of training with Adam and makes sure the losses match PyTorch. To test the GPU version we run:
 
@@ -114,11 +116,13 @@ make test_gpt2cu PRECISION=FP32 && ./test_gpt2cu
 make test_gpt2cu USE_CUDNN=1 && ./test_gpt2cu
 ```
 
+这测试了fp32路径和混合精度路径。测试应该通过并打印“总体正常：1”。
+
 This tests both the fp32 path and the mixed precision path. The test should pass and print `overall okay: 1`.
 
-## tutorial
+## 教程
 
-I attached a very small tutorial here, in [doc/layernorm/layernorm.md](doc/layernorm/layernorm.md). It's a simple, step-by-step guide to implementing a single layer of the GPT-2 model, the layernorm layer. This is a good starting point to understand how the layers are implemented in C.
+参见 [doc/layernorm/layernorm.md](doc/layernorm/layernorm.md). 逐步讲解如何实现 GPT-2 的一个层（LayerNorm），适合入门理解 C 中的层实现。C.
 
 **flash attention**. As of May 1, 2024 we use the Flash Attention from cuDNN. Because cuDNN bloats the compile time from a few seconds to ~minute and this code path is right now very new, this is disabled by default. You can enable it by compiling like this:
 
@@ -190,18 +194,6 @@ done
 ```
 
 This example opens up 4 screen sessions and runs the four commands with different LRs. This writes the log files `stories$i.log` with all the losses, which you can plot as you wish in Python. A quick example of how to parse and plot these logfiles is in [dev/vislog.ipynb](dev/vislog.ipynb).
-
-## repo
-
-A few more words on what I want this repo to be:
-
-First, I want `llm.c` to be a place for education. E.g. our `dev/cuda` folder is a place for a library of kernels for all the layers that are manually hand-written and very well documented, starting from very simple kernels all the way to more complex / faster kernels. If you have a new kernel with various different tradeoffs, please feel free to contribute it here.
-
-That said, I also want `llm.c` to be very fast too, even practically useful to train networks. E.g. to start, we should be able to reproduce the big GPT-2 (1.6B) training run. This requires that we incorporate whatever fastest kernels there are, including the use of libraries such as cuBLAS, cuBLASLt, CUTLASS, cuDNN, etc. I also think doing so serves an educational purpose to establish an expert upper bound, and a unit of measurement, e.g. you could say that your manually written kernels are 80% of cuBLAS speed, etc. Then you can choose to do a super fast run, or you can choose to "drag and drop" whatever manual kernels you wish to use, and run with those.
-
-However, as a constraint, I want to keep the mainline `llm.c` in the root folder simple and readable. If there is a PR that e.g. improves performance by 2% but it "costs" 500 lines of complex C code, and maybe an exotic 3rd party dependency, I may reject the PR because the complexity is not worth it. As a concrete example - making cuBLAS for matmuls the default in the root training loop is a no-brainer: it makes the mainline code much faster, it is a single line of interpretable code, and it is a very common dependency. On the side of this, we can have manual implementations that can compete with cuBLAS in `dev/cuda`.
-
-Lastly, I will be a lot more sensitive to complexity in the root folder of the project, which contains the main / default files of the project. In comparison, the `dev/` folder is a bit more of a scratch space for us to develop a library of kernels or classes and share useful or related or educational code, and some of this code could be ok to be (locally) complex.
 
 
 ## license

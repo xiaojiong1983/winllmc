@@ -40,7 +40,10 @@ int main(int argc, char *argv[]) {
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+
+    printf("the size of GPT2 is %zu bytes\n", sizeof(GPT2));
+
+    gpt2_build_from_checkpoint(&model, "gpt2_d12.bin");
 
     int C = model.config.channels;
     int V = model.config.vocab_size;
@@ -49,7 +52,7 @@ int main(int argc, char *argv[]) {
     int L = model.config.num_layers;
 
     // load additional information that we will use for debugging and error checking
-    FILE *state_file = fopen("gpt2_124M_debug_state.bin", "rb");
+    FILE *state_file = fopen("gpt2_d12_debug_state.bin", "rb");
     if (state_file == NULL) { printf("Error opening state file\n"); return 1; }
     int state_header[256];
     freadCheck(state_header, sizeof(int), 256, state_file);

@@ -62,7 +62,7 @@ void test_simple(void) {
     int process_rank = 0;
     int num_processes = 1;
     int should_shuffle = 0;
-    snprintf(shard_name, SHARD_NAME_LEN, "shard_????.bin");
+    snprintf(shard_name, SHARD_NAME_LEN, "shard_0003.bin");
     DataLoader loader;
     dataloader_init(&loader, shard_name, B, T, process_rank, num_processes, should_shuffle);
 

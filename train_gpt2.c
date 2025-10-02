@@ -27,6 +27,17 @@ There will be other versions of this code that specialize it and make it fast.
 #include "llmc/tokenizer.h"
 // defines: dataloader_init, dataloader_reset, dataloader_next_batch, dataloader_free
 #include "llmc/dataloader.h"
+#include "llmc/logger.h"
+
+// defines: lr_scheduler_init, get_learning_rate
+#include "llmc/schedulers.h"
+
+// defines: OutlierDetector, init_detector, update_detector
+#include "llmc/outlier_detector.h"
+
+// ----------------------------------------------------------------------------
+// global vars for I/O
+char filename_buffer[512];
 
 // ----------------------------------------------------------------------------
 // all the individual layers' forward and backward passes
@@ -704,14 +715,39 @@ typedef struct {
     float mean_loss; // after a forward pass with targets, will be populated with the mean loss
 } GPT2;
 
-void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
+
+void gpt2_init_common(GPT2 *model) {
+    // common inits outside of the model weights
+    // memory lazily initialized in forward()
+    model->acts_memory = NULL;
+    model->inputs = NULL;
+    model->targets = NULL;
+    // the B,T params are determined and set, fixed on first batch in forward()
+    model->batch_size = 0;
+    model->seq_len = 0;
+    model->mean_loss = -1.0f; // -1.0f designates no loss, set at end of forward()
+    model->params_memory = NULL;
+    // memory lazily initialized in backward()
+    model->grads_memory = NULL;
+    // model->workload_indices = NULL; // on cpu, for encoder_backward
+    // model->bucket_info = NULL; // on cpu, for encoder_backward
+    // memory lazily initialized in update()
+    model->m_memory = NULL;
+    model->v_memory = NULL;
+}
+
+void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path, int weight_init) {
 
     // read in model from a checkpoint file
     FILE *model_file = fopenCheck(checkpoint_path, "rb");
     int model_header[256];
+    memset(model_header, 0, sizeof(model_header));
+
     freadCheck(model_header, sizeof(int), 256, model_file);
     if (model_header[0] != 20240326) { printf("Bad magic model file\n"); exit(1); }
-    if (model_header[1] != 3) {
+    if (!(model_header[1] == 3 || model_header[1] == 5)) {
+        // 3 = fp32, padded vocab
+        // 5 = bf16, padded vocab, layernorms also in bf16        
         printf("Bad version in model file\n");
         printf("---> HINT: try to re-run `python train_gpt2.py`\n");
         exit(1);
@@ -719,19 +755,19 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
 
     // read in hyperparameters
     size_t maxT, V, Vp, L, NH, C; // size_t to prevent int overflow
-    model->config.max_seq_len = maxT = model_header[2];
-    model->config.vocab_size = V = model_header[3];
-    model->config.num_layers = L = model_header[4];
-    model->config.num_heads = NH = model_header[5];
-    model->config.channels = C = model_header[6];
-    model->config.padded_vocab_size = Vp = model_header[7];
+    model->config.max_seq_len = maxT = model_header[2]; //max sequence length
+    model->config.vocab_size = V = model_header[3]; //vocab size
+    model->config.num_layers = L = model_header[4]; //number of layers
+    model->config.num_heads = NH = model_header[5]; //number of heads
+    model->config.channels = C = model_header[6];   //channels
+    model->config.padded_vocab_size = Vp = model_header[7]; //padded vocab size
     printf("[GPT-2]\n");
-    printf("max_seq_len: %zu\n", maxT);
-    printf("vocab_size: %zu\n", V);
-    printf("padded_vocab_size: %zu\n", Vp);
-    printf("num_layers: %zu\n", L);
-    printf("num_heads: %zu\n", NH);
-    printf("channels: %zu\n", C);
+    printf("max_seq_len: %Iu\n", maxT);
+    printf("vocab_size: %Iu\n", V);
+    printf("padded_vocab_size: %Iu\n", Vp);
+    printf("num_layers: %Iu\n", L);
+    printf("num_heads: %Iu\n", NH);
+    printf("channels: %Iu\n", C);
 
     // allocate space for all the parameters and read them in
     fill_in_parameter_sizes(model->param_sizes,  model->config);
@@ -741,13 +777,15 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
         num_parameters += model->param_sizes[i];
     }
-    printf("num_parameters: %zu\n", num_parameters);
+    printf("num_parameters: %Iu\n", num_parameters);
     model->num_parameters = num_parameters;
 
     // read in all the parameters from file
     model->params_memory = malloc_and_point_parameters(&model->params, model->param_sizes);
-    freadCheck(model->params_memory, sizeof(float), num_parameters, model_file);
-    fcloseCheck(model_file);
+    if (weight_init) {
+        freadCheck(model->params_memory, sizeof(float), num_parameters, model_file);
+        fcloseCheck(model_file);
+    }
 
     // other inits
     model->acts_memory = NULL;
@@ -760,6 +798,151 @@ void gpt2_build_from_checkpoint(GPT2 *model, const char* checkpoint_path) {
     model->batch_size = 0;
     model->seq_len = 0;
     model->mean_loss = -1.0f; // -1.0f will designate no loss
+}
+
+
+
+// allocate memory for the parameters only, without initializing them
+float* malloc_parameters(size_t* param_sizes) {
+    size_t num_parameters = 0;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        num_parameters += param_sizes[i];
+    }
+    // malloc all parameters all at once
+    float* params_memory = (float*)mallocCheck(num_parameters * sizeof(float));
+    memset(params_memory, 0, num_parameters * sizeof(float));
+    return params_memory;
+}
+
+
+void gpt3_set_hyperparameters(GPT2Config* config, const char* channels_str) {
+    // we use channels instead of depth for GPT-3 because GPT-3 model depths are not one-to-one
+    // note that our models are not necessarily identical to GPT-3 because
+    // we use dense attention, not the alternating dense/banded attention of GPT-3
+    int channels = atoi(channels_str);
+    assert(channels > 0); // atoi returns 0 if not a number
+    int depth, head_size;
+    if      (channels == 384)   { depth = 6;  head_size = 64; }  // (unofficial) gpt3-tiny (31M)
+    else if (channels == 768)   { depth = 12; head_size = 64; }  // gpt3-small (125M)
+    else if (channels == 1024)  { depth = 24; head_size = 64; }  // gpt3-medium (350M)
+    else if (channels == 1536)  { depth = 24; head_size = 96; }  // gpt3-large (760M)
+    else if (channels == 2048)  { depth = 24; head_size = 128; } // gpt3-xl (1.3B) [heads fixed]
+    else if (channels == 2560)  { depth = 32; head_size = 80; }  // gpt3-2.7B
+    else if (channels == 4096)  { depth = 32; head_size = 128; } // gpt3-6.7B
+    else if (channels == 5140)  { depth = 40; head_size = 128; } // gpt3-13B
+    else if (channels == 12288) { depth = 96; head_size = 128; } // gpt3 (175B)
+    else { fprintf(stderr, "Unsupported GPT-3 channels: %d\n", channels); exit(EXIT_FAILURE); }
+    assert(channels % head_size == 0);
+    config->num_layers = depth;
+    config->channels = channels;
+    config->num_heads = channels / head_size;
+    config->max_seq_len = 2048; // NOTE: GPT-3 uses context length of 2048 tokens, up from 1024 in GPT-2
+}
+
+void gpt2_set_hyperparameters(GPT2Config* config, const char* depth_str) {
+    int depth = atoi(depth_str);
+    assert(depth > 0); // atoi returns 0 if not a number
+    int channels, num_heads;
+    if      (depth == 6)  { channels = 384; num_heads = 6; }   // (unofficial) gpt2-tiny (30M)
+    else if (depth == 12) { channels = 768; num_heads = 12; }  // gpt2 (124M)
+    else if (depth == 24) { channels = 1024; num_heads = 16; } // gpt2-medium (350M)
+    else if (depth == 36) { channels = 1280; num_heads = 20; } // gpt2-large (774M)
+    else if (depth == 48) { channels = 1600; num_heads = 25; } // gpt2-xl (1558M)
+    else if (depth == 60) { channels = 1920; num_heads = 30; } // (unofficial) 2.7B
+    else if (depth == 72) { channels = 2880; num_heads = 30; } // (unofficial) 7.3B
+    else if (depth == 84) { channels = 3456; num_heads = 36; } // (unofficial) 12.2B
+    else { fprintf(stderr, "Unsupported GPT-2 depth: %d\n", depth); exit(EXIT_FAILURE); }
+    config->num_layers = depth;
+    config->channels = channels;
+    config->num_heads = num_heads;
+    config->max_seq_len = 1024;
+}
+
+void gpt_build_from_descriptor(GPT2 *model, const char* descriptor) {
+    // The model descriptor can be:
+    // - legacy format "dX", where X is number, e.g. "d12". This creates GPT-2 model with 12 layers.
+    // - new explicit format "gpt2:dX", same as above, e.g. "gpt2:d48" for GPT-2 with 48 layers.
+    // - "gpt3:cX", where X is now the channel count, e.g. "gpt3:c768" is the smallest GPT-3 model.
+
+    // check the valid prexies and dispatch to the right setup function
+    assert(descriptor != NULL);
+    size_t len = strlen(descriptor);
+    if (len > 1 && descriptor[0] == 'd') {
+        gpt2_set_hyperparameters(&model->config, descriptor + 1); // pass along the depth str without the 'd'
+    } else if (len > 6 && strncmp(descriptor, "gpt2:d", 6) == 0) {
+        gpt2_set_hyperparameters(&model->config, descriptor + 6); // pass along the depth str without the 'gpt2:d'
+    } else if (len > 6 && strncmp(descriptor, "gpt3:c", 6) == 0) {
+        gpt3_set_hyperparameters(&model->config, descriptor + 6); // pass along the channels str without the 'gpt3:c'
+    } else {
+        fprintf(stderr, "Unsupported model descriptor: %s\n", descriptor); exit(EXIT_FAILURE);
+    }
+
+    // both GPT-2 and GPT-3 use the same tokenizer with 50257 tokens
+    model->config.vocab_size = 50257;
+    model->config.padded_vocab_size = 50304; // padded to 128 for CUDA kernel efficiency
+
+    // allocate space for all the parameters and read them in
+    fill_in_parameter_sizes(model->param_sizes,  model->config);
+    // count the number of parameters,add by gjg 20250926
+    size_t num_parameters = 0;
+    for (size_t i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+        num_parameters += model->param_sizes[i];
+    }
+    printf("num_parameters: %Iu\n", num_parameters);
+    model->num_parameters = num_parameters;
+
+    // allocate and random init the memory for all the parameters with GPT-2 schema
+    // weights ~N(0, 0.02), biases 0, c_proj weights ~N(0, 0.02/(2*L)**0.5)
+    // NOTE: assuming all parameters are of the type floatX, could be relaxed later
+    mt19937_state init_rng;
+    manual_seed(&init_rng, 42);
+    model->params_memory = malloc_parameters(model->param_sizes);
+    float* params_memory_cpu = model->params_memory;
+
+    // fill in all the weights with random values
+    float residual_scale = 1.0f / sqrtf(2.0f * model->config.num_layers);
+    // we have to init all these tensors exactly in the order that PyTorch initializes them
+    // so that we can match them up and get correctness and exactly the same initial conditions
+    size_t L = model->config.num_layers;
+    size_t offset = 0;
+    for (int l = 0; l < L; l++) {
+        offset = 0;
+        for (int i = 0; i < NUM_PARAMETER_TENSORS; i++) {
+            // the layernorm parameters are all initialized to 1
+            if (l == 0 && (i == 2 || i == 8 || i == 14)) { // only at l = 0 to init these just once
+                for (size_t j = 0; j < model->param_sizes[i]; j++) {
+                    params_memory_cpu[offset + j] = 1.0f;
+                }
+            }
+            // weights tensors are handled here
+            if ((l == 0 && (i == 0 || i == 1)) // only at l = 0, init the wte and wpe tensors
+              || i == 4 || i == 6 || i == 10 || i == 12) {
+                size_t n = model->param_sizes[i];
+                size_t layer_offset = 0;
+                if (i == 0) {
+                    // for wte tensor (padded vocab) override to init V instead of Vp rows
+                    n = model->config.vocab_size * model->config.channels;
+                }
+                if (i == 4 || i == 6 || i == 10 || i == 12) {
+                    // weight tensors, we are only initializing layer l
+                    assert(n % L == 0);
+                    n = n / L;
+                    layer_offset = l * n;
+                }
+                // in GPT-2, the projections back into the residual stream are additionally
+                // scaled by 1/sqrt(2*L) for training stability
+                float scale = (i == 6 || i == 12) ? 0.02f * residual_scale : 0.02f;
+                // okay let's draw the random numbers and write them
+                float *fp32_buffer = (float*)mallocCheck(n * sizeof(float));
+                normal_(fp32_buffer, n, 0.0f, scale, &init_rng);
+                for (size_t j = 0; j < n; j++) {
+                    params_memory_cpu[offset + layer_offset + j] = fp32_buffer[j];
+                }
+                free(fp32_buffer);
+            }
+            offset += model->param_sizes[i];
+        }
+    }
 }
 
 void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
@@ -797,7 +980,7 @@ void gpt2_forward(GPT2 *model, int* inputs, int* targets, size_t B, size_t T) {
         for (size_t i = 0; i < NUM_ACTIVATION_TENSORS; i++) {
             num_activations += model->act_sizes[i];
         }
-        printf("num_activations: %zu\n", num_activations);
+        printf("num_activations: %Iu\n", num_activations);
         model->num_activations = num_activations;
         model->acts_memory = malloc_and_point_activations(&model->acts, model->act_sizes);
         // also create memory for caching inputs and targets
@@ -1072,45 +1255,370 @@ int sample_mult(float* probabilities, int n, float coin) {
     return n - 1; // in case of rounding errors
 }
 
+
+// ----------------------------------------------------------------------------
+// CLI, poor man's argparse
+// (all single letters have been claimed now)
+
+void error_usage() {
+    fprintf(stderr, "Usage:   ./train_gpt2cpu [options]\n");
+    fprintf(stderr, "Options:\n");
+    // file system input / output
+    fprintf(stderr, "  -i <string> train data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_train.bin)\n");
+    fprintf(stderr, "  -j <string> val data filename pattern (default = dev/data/tinyshakespeare/tiny_shakespeare_val.bin)\n");
+    fprintf(stderr, "  -e <string> input .bin filename or descriptor, see code comments as docs. (default = gpt2_124M_bf16.bin)\n");
+    fprintf(stderr, "  -o <string> output log dir (default = NULL, no logging)\n");
+    fprintf(stderr, "  -lg <int>   log gpu info every x steps (default = -1; disabled)\n");
+    fprintf(stderr, "  -n <int>    write optimization checkpoints every how many steps? (default 0, don't)\n");
+    fprintf(stderr, "  -nk <int>   max number of checkpoints to keep in the directory, removing old ones (0 = disable, default)\n");
+    fprintf(stderr, "  -nm <int>   every how many step checkpoints are considered major? major checkpoints never get deleted.\n");
+    fprintf(stderr, "  -y <int>    resume optimization found inside output log dir? (0=restart/overwrite, 1=resume/append)\n");
+    // token layout for each step of the optimization
+    fprintf(stderr, "  -b <int>    (per-GPU, micro) batch size B (default = 4)\n");
+    fprintf(stderr, "  -t <int>    sequence length T (default = 1024)\n");
+    fprintf(stderr, "  -d <int>    total desired batch size (default = B * T * num_processes, i.e. no grad accumulation\n");
+    // workload (number of steps)
+    fprintf(stderr, "  -x <int>    max_steps of optimization to run (-1 (default) = disable, run 1 epoch)\n");
+    // optimization
+    fprintf(stderr, "  -k <string> learning rate scheduler (default = cosine)\n");
+    fprintf(stderr, "  -l <float>  learning rate (default = 3e-4f)\n");
+    fprintf(stderr, "  -u <int>    learning rate warmup iterations (default = 0, no warmup)\n");
+    fprintf(stderr, "  -q <float>  learning rate decay: final fraction, at end of training (default = 1.0 (no decay))\n");
+    fprintf(stderr, "  -c <float>  weight decay (default = 0.0f)\n");
+    fprintf(stderr, "  -sl <float> outlier stability: skip update if loss goes above this in zscore (0.0f=off)\n");
+    fprintf(stderr, "  -sg <float> outlier stability: skip update if grad_norm goes above this in zscore (0.0f=off)\n");
+    // evaluation
+    fprintf(stderr, "  -v <int>    val_loss_every, how often we evaluate val loss (default = 20)\n");
+    fprintf(stderr, "  -m <int>    val_max_steps, up to how many val batches to estimate val loss? (default = 20)\n");
+    fprintf(stderr, "  -s <int>    sample_every, how often we inference the model (default = 20)\n");
+    fprintf(stderr, "  -g <int>    genT, how many steps of inference we do (default = 64)\n");
+    fprintf(stderr, "  -h <int>    hellaswag eval run? (default = 0)\n");
+    // debugging
+    fprintf(stderr, "  -a <int>    overfit a single batch? 0/1. useful for debugging\n");
+    // numerics
+    fprintf(stderr, "  -f <int>    enable_tf32 override (default: 1, set to 0 to disable tf32)\n");
+    fprintf(stderr, "  -w <int>    keep f32 copy of weights for the optimizer? (default: 1)\n");
+    fprintf(stderr, "  -ge <int>   gelu fusion: 0=none, 1=forward, 2=forward+backward (default: 2 for >=SM90, 0 for older GPUs)\n");
+    // memory management
+    fprintf(stderr, "  -z <int>    zero_stage, Zero Optimization Stage, 0,1,2,3 (default = 0)\n");
+    fprintf(stderr, "  -r <int>    recompute: less memory but less speed. (default = 1), 0|1|2 = none,gelu,gelu+ln\n");
+    // multi-node settings
+    fprintf(stderr, "  -pn <int>    num_processes (default = 1)\n");
+    fprintf(stderr, "  -pr <int>    process_rank (default = 0)\n");
+    fprintf(stderr, "  -pg <int>    gpus_per_node (default = 8)\n");
+    fprintf(stderr, "  -pm <string> nccl_init_method: tcp,fs,mpi (default = mpi)\n");
+    fprintf(stderr, "  -ps <string> server_ip - used only when nccl_init_method is tcp (default = -1)\n");
+    fprintf(stderr, "  -pp <string> fs_path - used only when nccl_init_method is fs (default = /tmp)\n");
+    exit(EXIT_FAILURE);
+}
+
+
 // ----------------------------------------------------------------------------
 // main training loop
-int main() {
+int main(int argc, char *argv[]) {
+    // default values for CLI args
+
+    // read in the (optional) command line arguments
+    const char* train_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
+    const char* val_data_pattern = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
+    const char* load_filename = "gpt2_124M.bin"; // bf16 weights of the model
+    const char* lr_scheduler_type = "cosine";
+    const char* output_log_dir = "log";
+    int checkpoint_every = 0; // write checkpoints every how many steps?
+    int checkpoints_keep = 0; // how long checkpoint history do we keep? (in units of checkpoints)
+    int major_checkpoint_every = 0; // major checkpoints never get deleted when maintaining history
+    int resume = 0; // resume the optimization, if one is found inside output_log_dir?
+    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
+    int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
+    int total_batch_size = -1; // will be calculated down below later, if not provided
+    float learning_rate = 3e-4f;
+    int log_gpu_every = -1;
+    int warmup_iterations = 0;
+    float final_learning_rate_frac = 1.0f; // final fraction of learning rate, at end of training
+    float weight_decay = 0.0f;
+    float skip_update_lossz = 0.0f; // skip update if loss goes above this in zscore
+    float skip_update_gradz = 0.0f; // skip update if grad_norm goes above this in zscore
+    int val_loss_every = 20; // every how many steps do we eval validation loss?
+    int val_max_steps = 2; // how many batches max do we eval for validation loss?
+    int max_steps = 4;
+
+    int sample_every = 20; // every how many steps to do inference?
+    int genT = 64; // number of steps of inference we will do
+    int overfit_single_batch = 0; // useful for debugging, 1 = only load a single data batch once
+    
+    int override_enable_tf32 = 1;
+    int use_master_weights = 1;
+    int gelu_fusion = -1; // 0 = none, 1 = forward, 2 = forward+backward (-1 => per-GPU default)
+    int recompute = 1; // recompute during backward setting, 0 = none, 1 = recompute gelu
+    int zero_stage = 0; // Zero Optimization Stage for Multi-GPU training
+    int hellaswag_eval = 0;
+    // multi-node settings
+    int num_processes = 1;  // this should be set by the slurm environment
+    int process_rank = 0;  // this should be set by the slurm environment
+    int gpus_per_node = 8;  // this should be set by the slurm environment
+    char nccl_init_method[256] = "mpi";  // "tcp" or "fs" or "mpi"
+    char server_ip[256] = "";  // used if init_method set to "tcp" -> set to your server ip address
+    char fs_path[256] = "";  // used if init_method set to "fs" -> set to a shared filesystem path
+    for (int i = 1; i < argc; i+=2) {
+        if (i + 1 >= argc) { error_usage(); } // must have arg after flag
+        if (argv[i][0] != '-') { error_usage(); } // must start with dash
+        if (!(strlen(argv[i]) == 2 || strlen(argv[i]) == 3)) { error_usage(); } // must be -x[y] (one dash, one or two letters)
+        // read in the args
+        if (argv[i][1] == 'i') { train_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'j') { val_data_pattern = argv[i+1]; }
+        else if (argv[i][1] == 'e') { load_filename = argv[i+1]; }
+        else if (argv[i][1] == 'o') { output_log_dir = argv[i+1]; }
+        else if (argv[i][1] == 'n' && argv[i][2] == '\0') { checkpoint_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'y') { resume = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'b') { B = atoi(argv[i+1]); } // Per-GPU (micro) batch size
+        else if (argv[i][1] == 't') { T = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'd') { total_batch_size = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'l' && argv[i][2] == '\0') { learning_rate = atof(argv[i+1]); }
+        else if (argv[i][1] == 'l' && argv[i][2] == 'g') { log_gpu_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'u') { warmup_iterations = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'q') { final_learning_rate_frac = atof(argv[i+1]); }
+        else if (argv[i][1] == 'c') { weight_decay = atof(argv[i+1]); }
+        else if (argv[i][1] == 'x') { max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'v') { val_loss_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'm') { val_max_steps = atoi(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == '\0') { sample_every = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g' && argv[i][2] == 'e') { gelu_fusion = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'g') { genT = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'a') { overfit_single_batch = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'f') { override_enable_tf32 = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'w') { use_master_weights = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'z') { zero_stage = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'r') { recompute = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'h') { hellaswag_eval = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'k') { lr_scheduler_type = argv[i+1]; }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'i') { strcpy(nccl_init_method, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'f') { strcpy(fs_path, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 's') { strcpy(server_ip, argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'n') { num_processes = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'r') { process_rank = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'p' && argv[i][2] == 'g') { gpus_per_node = atoi(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == 'l') { skip_update_lossz = atof(argv[i+1]); }
+        else if (argv[i][1] == 's' && argv[i][2] == 'g') { skip_update_gradz = atof(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'k') { checkpoints_keep = atoi(argv[i+1]); }
+        else if (argv[i][1] == 'n' && argv[i][2] == 'm') { major_checkpoint_every = atoi(argv[i+1]); }
+        else { error_usage(); }
+    }
+    // print out the args
+
+    printf("+-----------------------+----------------------------------------------------+\n");
+    printf("| Parameter             | Value                                              |\n");
+    printf("+-----------------------+----------------------------------------------------+\n");
+    printf("| train data pattern    | %-50s |\n", train_data_pattern);
+    printf("| val data pattern      | %-50s |\n", val_data_pattern);
+    printf("| output log dir        | %-50s |\n", output_log_dir == NULL ? "log" : output_log_dir);
+    printf("| checkpoint_every      | %-50d |\n", checkpoint_every);
+    printf("| resume                | %-50d |\n", resume);
+    printf("| micro batch size B    | %-50d |\n", B);
+    printf("| sequence length T     | %-50d |\n", T);
+    printf("| total batch size      | %-50d |\n", total_batch_size);
+    printf("| LR scheduler          | %-50s |\n", lr_scheduler_type);
+    printf("| learning rate (LR)    | %-50e |\n", learning_rate);
+    printf("| warmup iterations     | %-50d |\n", warmup_iterations);
+    printf("| final LR fraction     | %-50e |\n", final_learning_rate_frac);
+    printf("| weight decay          | %-50e |\n", weight_decay);
+    printf("| skip update lossz     | %-50f |\n", skip_update_lossz);
+    printf("| skip update gradz     | %-50f |\n", skip_update_gradz);
+    printf("| max_steps             | %-50d |\n", max_steps);
+    printf("| val_loss_every        | %-50d |\n", val_loss_every);
+    printf("| val_max_steps         | %-50d |\n", val_max_steps);
+    printf("| sample_every          | %-50d |\n", sample_every);
+    printf("| genT                  | %-50d |\n", genT);
+    printf("| overfit_single_batch  | %-50d |\n", overfit_single_batch);
+    printf("| use_master_weights    | %-50s |\n", use_master_weights ? "enabled" : "disabled");
+    printf("| gelu_fusion           | %-50d |\n", gelu_fusion);
+    printf("| recompute             | %-50d |\n", recompute);
+    printf("+-----------------------+----------------------------------------------------+\n");
+    printf("| zero_stage            | %-50d |\n", zero_stage);
+    printf("| hellaswag_eval        | %-50d |\n", hellaswag_eval);
+    printf("+-----------------------+----------------------------------------------------+\n");
+    printf("| num_processes         | %-50d |\n", num_processes);
+    printf("| process_rank          | %-50d |\n", process_rank);
+    printf("| gpus_per_node         | %-50d |\n", gpus_per_node);
+    printf("| nccl_init_method      | %-50s |\n", nccl_init_method);
+    if (strcmp(nccl_init_method, "tcp") == 0) {
+        printf("| server_ip             | %-50s |\n", server_ip);
+    }   
+
+    // ----------------------------------------------------------------------------
+    // validate the args    
+
+
+
+    // some basic checks
+    if (B <= 0 || T <= 0) {
+        printf("Error: batch size B and sequence length T must be positive\n");
+        exit(1);
+    }
+    if (total_batch_size == -1) {
+        total_batch_size = B * num_processes;
+        printf("calculated total_batch_size = %d\n", total_batch_size);
+    } else {
+        if (total_batch_size % num_processes != 0) {
+            printf("Error: total_batch_size must be divisible by num_processes\n");
+            exit(1);
+        }
+        if (total_batch_size / num_processes < B) {
+            printf("Error: total_batch_size / num_processes must be >= B\n");
+            exit(1);
+        }
+    }
+    if (max_steps == -1) {
+        printf("Warning: max_steps not set, will run 1 epoch and then stop\n");
+    }
+    if (gelu_fusion == -1) {
+        // per-GPU default
+        gelu_fusion = gpus_per_node >= 8 ? 2 : 0; // 2 = forward+backward, 0 = none
+    }
+    if (gelu_fusion < 0 || gelu_fusion > 2) {
+        printf("Error: gelu_fusion must be 0, 1, or 2\n");
+        exit(1);
+    }
+    if (recompute < 0 || recompute > 2) {
+        printf("Error: recompute must be 0, 1, or 2\n");
+        exit(1);
+    }
+    if (zero_stage < 0 || zero_stage > 3) {
+        printf("Error: zero_stage must be 0, 1, 2, or 3\n");
+        exit(1);
+    }
+    if (zero_stage > 0 && num_processes == 1) {
+        printf("Warning: zero_stage > 0 but num_processes = 1, not using distributed training\n");
+    }
+    if (zero_stage == 3) {
+        printf("Error: zero_stage 3 not supported in this CPU implementation\n");
+        exit(1);
+    }
+    if (strcmp(lr_scheduler_type, "cosine") != 0 && strcmp(lr_scheduler_type, "linear") != 0) {
+        printf("Error: lr_scheduler_type    must be 'cosine' or 'linear'\n");
+        exit(1);
+    }
+    if (strcmp(nccl_init_method, "tcp") != 0 && strcmp(nccl_init_method, "fs") != 0 && strcmp(nccl_init_method, "mpi") != 0) {
+        printf("Error: nccl_init_method must be 'tcp', 'fs', or 'mpi'\n");
+        exit(1);
+    }
+    if (strcmp(nccl_init_method, "tcp") == 0 && strlen(server_ip) == 0) {
+        printf("Error: nccl_init_method is 'tcp' but server_ip is not set\n");
+        exit(1);
+    }
+    if (strcmp(nccl_init_method, "fs") == 0 && strlen(fs_path) == 0) {
+        printf("Error: nccl_init_method is 'fs' but fs_path is not set\n");
+        exit(1);    
+    }
+    // end of CLI args
+    // ---------------------------------------------------------------------------- 
+    // build the model
+    printf("building the GPT-2 model...\n");
+    // set the global flags for tf32 and gelu fusion
+    if (override_enable_tf32 == 0) {
+        // disable tf32
+        // (this is a no-op on CPU, but we keep it for compatibility with GPU code)
+        // on GPU, this would be: cudaDeviceSetTf32MathMode(cudaTf32MathModeDisabled);
+    }
+    // figure out if we are going to be resuming the optimization
+    int resuming = 0;
+    // find the DONE file with the highest step count
+    int resume_max_step = find_max_step(output_log_dir);
+    if (resume == 1) { // is -y 1 resume flag set?
+        assert(output_log_dir != NULL);
+        if (resume_max_step != -1) {
+            resuming = 1; // -y 1 is set, and we found a checkpoint we can resume from
+            snprintf(filename_buffer, sizeof(filename_buffer), "%s/model_%08d.bin", output_log_dir, resume_max_step);
+        }
+    }
+    if (resuming) {
+        printf("resuming optimization from step %d\n", resume_max_step);
+    } else {
+        printf("starting optimization from scratch\n");
+    }
+    if (resuming && checkpoint_every == 0) {
+        printf("warning: resuming optimization (-y 1) but checkpoint_every = 0, so no new checkpoints will be written\n");
+    }
+    if (resuming && max_steps != -1 && resume_max_step >= max_steps) {
+        printf("warning: resuming optimization (-y 1) but max_steps = %d, which is less than or equal to the step we are resuming from (%d), so no optimization will be done\n", max_steps, resume_max_step);
+    } 
+
+
 
     // build the GPT-2 model from a checkpoint
     GPT2 model;
-    gpt2_build_from_checkpoint(&model, "gpt2_124M.bin");
+
+    gpt2_init_common(&model);
+    if (resuming == 1) {
+        // if `-y 1` was set, then we are resuming from the latest checkpoint
+        // if we are using master weights, we'll init them later inside load_state()
+        int weight_init = !use_master_weights;
+        gpt2_build_from_checkpoint(&model, filename_buffer, weight_init);
+    } else if (ends_with_bin(load_filename)) {
+        // otherwise, if this is a .bin file, we assume it's a model, let's init from it
+        gpt2_build_from_checkpoint(&model, load_filename, 1);
+    } else {
+        // if it's not .bin, it could be a "special descriptor". This descriptor is used to
+        // construct GPT-2 / GPT-3 models in a convenient format. See the function for docs.
+        gpt_build_from_descriptor(&model, load_filename);
+    }
+
+    int tokens_per_fwdbwd = B * T * 1; // one micro-batch processes this many tokens
+                                       // Multi-GPU support is disabled. Using a single CPU process.
+    
 
     // build the DataLoaders from tokens files. for now use tiny_shakespeare if available, else tiny_stories
-    const char* tiny_stories_train = "dev/data/tinystories/TinyStories_train.bin";
-    const char* tiny_stories_val = "dev/data/tinystories/TinyStories_val.bin";
-    const char* tiny_shakespeare_train = "dev/data/tinyshakespeare/tiny_shakespeare_train.bin";
-    const char* tiny_shakespeare_val = "dev/data/tinyshakespeare/tiny_shakespeare_val.bin";
-    const char* train_tokens = access(tiny_shakespeare_train, F_OK) != -1 ? tiny_shakespeare_train : tiny_stories_train;
-    const char* val_tokens = access(tiny_shakespeare_val, F_OK) != -1 ? tiny_shakespeare_val : tiny_stories_val;
-    int B = 4; // batch size 4 (i.e. 4 independent token sequences will be trained on)
-    int T = 64; // sequence length 64 (i.e. each sequence is 64 tokens long). must be <= maxT, which is 1024 for GPT-2
     DataLoader train_loader, val_loader;
-    dataloader_init(&train_loader, train_tokens, B, T, 0, 1, 1);
-    dataloader_init(&val_loader, val_tokens, B, T, 0, 1, 0);
-    printf("train dataset num_batches: %zu\n", train_loader.num_tokens / (B*T));
-    printf("val dataset num_batches: %zu\n", val_loader.num_tokens / (B*T));
-    int val_num_batches = 5;
+    dataloader_init(&train_loader, train_data_pattern, B, T, 0, 1, 1);
+    dataloader_init(&val_loader, val_data_pattern, B, T, 0, 1, 0);
+    
+    // figure out the number of training steps we will run for
+    int train_num_batches = max_steps; // passed in from command line
+    if (train_num_batches == -1) {
+        // sensible default is to train for exactly one epoch
+        size_t ntok = train_loader.num_tokens;
+        // the number of (outer loop) steps each process should take for us to reach one epoch
+        train_num_batches = ntok / total_batch_size;
+    }
+    // figure out the number of validation steps to run for
+    int val_num_batches = val_max_steps; // passed in from command line
+    if (val_num_batches == -1) {
+        // sensible default is to evaluate the full validation split
+        size_t ntok = val_loader.num_tokens;
+        // note that unlike the training loop, there is no gradient accumulation inner loop here
+        val_num_batches = ntok / tokens_per_fwdbwd;
+    }
+    printf("| train_num_batches     | %-50d |\n", train_num_batches);
+    printf("| val_num_batches       | %-50d |\n", val_num_batches);
+    printf("+-----------------------+----------------------------------------------------+\n");
 
+    // set up logging
+    create_dir_if_not_exists(output_log_dir); 
+    Logger logger;
+    logger_init(&logger, output_log_dir, 0, resume);
+    printf("logging to %s\n", logger.output_log_file);
+    
     // build the Tokenizer
     Tokenizer tokenizer;
     tokenizer_init(&tokenizer, "gpt2_tokenizer.bin");
 
+    // set up learning rate scheduler
+    LearningRateScheduler lr_scheduler;
+    lr_scheduler_init(&lr_scheduler, lr_scheduler_type, learning_rate,
+                      warmup_iterations, train_num_batches, final_learning_rate_frac);    
+
     // some memory for generating samples from the model
     uint64_t rng_state = 1337;
     int* gen_tokens = (int*)mallocCheck(B * T * sizeof(int));
-    const int genT = 64; // number of steps of inference we will do
 
     // train
     struct timespec start, end;
-    for (int step = 0; step <= 40; step++) {
 
-        // once in a while estimate the validation loss
-        if (step % 10 == 0) {
+    dataloader_reset(&train_loader); // start from the beginning of the training data
+                                     // added by gjg @20251002,am i right? checked for later.!!
+    for (int step = 0; step <= train_num_batches; step++) {
+
+        // estimate the validation loss at first just for testing purposes.changed by gjg @20251002
+        if (step == 0) {
             float val_loss = 0.0f;
             dataloader_reset(&val_loader);
             for (int i = 0; i < val_num_batches; i++) {
@@ -1120,10 +1628,12 @@ int main() {
             }
             val_loss /= val_num_batches;
             printf("val loss %f\n", val_loss);
+            logger_log_val(&logger, step, val_loss);
         }
 
-        // once in a while do model inference to print generated text
-        if (step > 0 && step % 20 == 0) {
+        // just for testing, at first step, generate some samples from the model.changed by gjg @20251002
+        // should be removed later, or made optional.!!!
+        if (step == 0) {
             // fill up gen_tokens with the GPT2_EOT, which kicks off the generation
             for(int i = 0; i < B * T; ++i) {
                 gen_tokens[i] = tokenizer.eot_token;
@@ -1159,16 +1669,23 @@ int main() {
             printf("\n---\n");
         }
 
+        // fetch the next learning rate
+        float step_learning_rate = get_learning_rate(&lr_scheduler, step);     
+
         // do a training step
         clock_gettime(CLOCK_MONOTONIC, &start);
+
         dataloader_next_batch(&train_loader);
         gpt2_forward(&model, train_loader.inputs, train_loader.targets, B, T);
-        gpt2_zero_grad(&model);
+        // gpt2_zero_grad(&model);  removed, as grads are zeroed inside gpt2_backward().edited by gjg@20250928
         gpt2_backward(&model);
-        gpt2_update(&model, 1e-4f, 0.9f, 0.999f, 1e-8f, 0.0f, step+1);
+        gpt2_update(&model, step_learning_rate, 0.9f, 0.999f, 1e-8f, weight_decay, step+1);
+
         clock_gettime(CLOCK_MONOTONIC, &end);
         double time_elapsed_s = (end.tv_sec - start.tv_sec) + (end.tv_nsec - start.tv_nsec) / 1e9;
         printf("step %d: train loss %f (took %f ms)\n", step, model.mean_loss, time_elapsed_s * 1000);
+
+        logger_log_train(&logger, step, model.mean_loss, step_learning_rate, 0.0f);
     }
 
     // free

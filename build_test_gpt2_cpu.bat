@@ -3,8 +3,7 @@ setlocal enabledelayedexpansion
 
 :: 基础配置
 set CC=gcc
-set OUT_CPU=train_gpt2_cpu.exe
-set OUT_CUDA=train_gpt2_cuda.exe
+set OUT_CPU=test_gpt2_cpu.exe
 set SRC_DIR=.
 set DEV_DIR=dev
 set LLMC_DIR=llmc
@@ -37,11 +36,11 @@ if not errorlevel 1 (
 :: 编译CPU版本
 echo.
 echo Building CPU version...
-set CPU_SRCS=%SRC_DIR%\train_gpt2.c
-set CPU_OBJS=%BUILD_DIR%\train_gpt2.o
+set CPU_SRCS=%SRC_DIR%\test_gpt2.c
+set CPU_OBJS=%BUILD_DIR%\test_gpt2.o
 
 :: 编译主源文件
-%CC% -g -Wall -O3 %OPENMP_FLAG% -I%LLMC_DIR% -I%DEV_DIR% -c %CPU_SRCS% -o %CPU_OBJS%
+%CC% -g -O3 %OPENMP_FLAG% -I%LLMC_DIR% -I%DEV_DIR% -c %CPU_SRCS% -o %CPU_OBJS%
 if errorlevel 1 goto :error
 
 :: 链接CPU版本
@@ -49,23 +48,6 @@ if errorlevel 1 goto :error
 if errorlevel 1 goto :error
 echo CPU build successful: %OUT_CPU%
 
-
-:: 编译测试程序
-echo.
-echo Building test programs...
-for %%f in (%DEV_DIR%\test\test_*.c) do (
-    set TEST_NAME=%%~nf
-    set TEST_SRC=%%f
-    set TEST_OUT=%BUILD_DIR%\!TEST_NAME!.exe
-    
-    echo Building !TEST_NAME!...
-::     %CC% -O3 -I%LLMC_DIR% -I%DEV_DIR% !TEST_SRC! -lm -lws2_32 -o !TEST_OUT!
-::     if errorlevel 1 (
-::         echo Warning: !TEST_NAME! build failed
-::     ) else (
-::         echo !TEST_NAME! built successfully
-::     )
-)
 
 echo.
 echo All builds completed successfully!

@@ -620,6 +620,9 @@ if __name__ == "__main__":
 
     # calculate gradient accumulation from the desired total batch size and the current run configuration
     tokens_per_fwdbwd = B * T * ddp_world_size
+    print(f"total_batch_size: {args.total_batch_size}")
+    print(f"tokens_per_fwdbwd: {tokens_per_fwdbwd}")
+
     assert args.total_batch_size % tokens_per_fwdbwd == 0
     grad_accum_steps = args.total_batch_size // tokens_per_fwdbwd
     print0(f"total desired batch size: {args.total_batch_size}")
@@ -661,6 +664,12 @@ if __name__ == "__main__":
     else:
         # load the GPT-2 model weights
         model = GPT.from_pretrained(args.model)
+    
+    # model initalization successful,show its base  configuration
+    config = model.config
+    print0("model config: %s" % str(config))
+    
+    
     model.train()
     model.to(device)
     if args.compile:

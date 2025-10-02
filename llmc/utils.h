@@ -49,14 +49,14 @@ extern inline void fread_check(void *ptr, size_t size, size_t nmemb, FILE *strea
         } else if (ferror(stream)) {
             fprintf(stderr, "Error: File read error at %s:%d\n", file, line);
         } else {
-            fprintf(stderr, "Error: Partial read at %s:%d. Expected %zu elements, read %zu\n",
+            fprintf(stderr, "Error: Partial read at %s:%d. Expected %Iu elements, read %Iu\n",
                     file, line, nmemb, result);
         }
         fprintf(stderr, "Error details:\n");
         fprintf(stderr, "  File: %s\n", file);
         fprintf(stderr, "  Line: %d\n", line);
-        fprintf(stderr, "  Expected elements: %zu\n", nmemb);
-        fprintf(stderr, "  Read elements: %zu\n", result);
+        fprintf(stderr, "  Expected elements: %Iu\n", nmemb);
+        fprintf(stderr, "  Read elements: %Iu\n", result);
         exit(EXIT_FAILURE);
     }
 }
@@ -123,14 +123,14 @@ extern inline void fwrite_check(void *ptr, size_t size, size_t nmemb, FILE *stre
         } else if (ferror(stream)) {
             fprintf(stderr, "Error: File write error at %s:%d\n", file, line);
         } else {
-            fprintf(stderr, "Error: Partial write at %s:%d. Expected %zu elements, wrote %zu\n",
+            fprintf(stderr, "Error: Partial write at %s:%d. Expected %Iu elements, wrote %Iu\n",
                     file, line, nmemb, result);
         }
         fprintf(stderr, "Error details:\n");
         fprintf(stderr, "  File: %s\n", file);
         fprintf(stderr, "  Line: %d\n", line);
-        fprintf(stderr, "  Expected elements: %zu\n", nmemb);
-        fprintf(stderr, "  Written elements: %zu\n", result);
+        fprintf(stderr, "  Expected elements: %Iu\n", nmemb);
+        fprintf(stderr, "  Written elements: %Iu\n", result);
         exit(EXIT_FAILURE);
     }
 }
@@ -147,7 +147,7 @@ extern inline void *malloc_check(size_t size, const char *file, int line) {
         fprintf(stderr, "Error details:\n");
         fprintf(stderr, "  File: %s\n", file);
         fprintf(stderr, "  Line: %d\n", line);
-        fprintf(stderr, "  Size: %zu bytes\n", size);
+        fprintf(stderr, "  Size: %Iu bytes\n", size);
         exit(EXIT_FAILURE);
     }
     return ptr;

@@ -1,0 +1,108 @@
+卷 软件 的文件夹 PATH 列表
+卷序列号为 C14D-581B
+E:.
+│  .gitignore
+│  build_test_gpt2_cpu.bat
+│  build_train_gpt2_cpu.bat
+│  LICENSE
+│  Makefile
+│  README.md
+│  requirements.txt
+│  t.txt
+│  test_dataloader.exe
+│  test_gpt2.c
+│  test_gpt2_cpu.exe
+│  test_outlier_detector.exe
+│  train_gpt2.c
+│  train_gpt2.exe
+│  train_gpt2.py
+│  train_gpt2_cpu.exe
+│  train_llama3.py
+│  
+├─.vscode
+│      launch.json
+│      settings.json
+│      tasks.json
+│      
+├─build
+├─dataset
+│      README.md
+│      
+├─dev
+│  │  download_starter_pack.sh
+│  │  loss_checker_ci.py
+│  │  unistd.h
+│  │  vislog.ipynb
+│  │  
+│  ├─cpu
+│  │      matmul_forward.c
+│  │      matmul_forward.o
+│  │      tt.exe
+│  │      
+│  ├─data
+│  │  │  data_common.py
+│  │  │  edu_fineweb.sh
+│  │  │  fineweb.py
+│  │  │  fineweb.sh
+│  │  │  gitattributes
+│  │  │  hellaswag.py
+│  │  │  hellaswag_val.bin
+│  │  │  input.txt
+│  │  │  lxhometown.txt
+│  │  │  mmlu.py
+│  │  │  README.md
+│  │  │  tinyshakespeare.py
+│  │  │  tinystories.py
+│  │  │  
+│  │  ├─tinyshakespeare
+│  │  ├─tinystories
+│  │  └─__pycache__
+│  │          data_common.cpython-310.pyc
+│  │          
+│  ├─eval
+│  │      export_hf.py
+│  │      README.md
+│  │      run_eval.sh
+│  │      summarize_eval.py
+│  │      
+│  └─test
+│          Makefile
+│          test_dataloader.c
+│          test_outlier_detector.c
+│          
+├─doc
+│  └─layernorm
+│          layernorm.c
+│          layernorm.md
+│          layernorm.py
+│          
+├─llmc
+│      cublas_common.h
+│      cuda_common.h
+│      cudnn_att.cpp
+│      cudnn_att.h
+│      dataloader.h
+│      gelu.cuh
+│      logger.h
+│      mfu.h
+│      outlier_detector.h
+│      rand.h
+│      sampler.h
+│      schedulers.h
+│      tokenizer.h
+│      utils.h
+│      
+└─scripts
+    │  pyrun_gpt2_124M.sh
+    │  README.md
+    │  run_gpt2_124M.sh
+    │  run_gpt2_1558M.sh
+    │  run_gpt2_350M.sh
+    │  run_gpt2_774M.sh
+    │  run_gpt3_125M.sh
+    │  
+    └─multi_node
+            run_gpt2_124M_fs.sbatch
+            run_gpt2_124M_mpi.sh
+            run_gpt2_124M_tcp.sbatch
+            

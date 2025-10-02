@@ -66,6 +66,7 @@ def tokenize(model_desc):
         # the EOT right after each \n\n, so I'm keeping that behavior for backwards compatibility
         # therefore we have to here add an extra \n\n at the end of each section, except the last
         spad = s + "\n\n" if i != len(sections) - 1 else s
+
         tokens.extend(encode(spad))
     # let's take the first 32,768 tokens as the validation split (~10%)
     val_tokens = tokens[:32768]
